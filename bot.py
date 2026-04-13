@@ -1,8 +1,10 @@
 import os
 import asyncio
 import logging
+from datetime import datetime, timezone, timedelta
+
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.types import (
     UserStatusOnline,
     UserStatusOffline,
@@ -32,21 +34,24 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
-# Состояния авторизации
+MSK = timezone(timedelta(hours=3))
+
+# Состояния
 LOGIN_IDLE = 0
 WAITING_PHONE = 1
 WAITING_CODE = 2
 WAITING_PASSWORD = 3
+WAITING_USERNAME = 4
 
 login_state = LOGIN_IDLE
 login_phone = None
 phone_code_hash = None
 
-# Мониторинг статуса
+# Мониторинг
 watched_username = None
 watched_input_peer = None
 last_known_status = None
-CHECK_INTERVAL = 15  # 15 секунд
+CHECK_INTERVAL = 5
 
 # Клиенты создаются в main()
 bot = None
@@ -59,22 +64,23 @@ def is_admin(event):
 
 def format_status(status):
     if isinstance(status, UserStatusOnline):
-        return "В сети"
+        return "🟢 В сети"
     elif isinstance(status, UserStatusOffline):
         was_online = status.was_online
         if was_online:
-            local_time = was_online.strftime("%d.%m.%Y %H:%M:%S UTC")
-            return f"Не в сети (был(а) {local_time})"
-        return "Не в сети"
+            msk_time = was_online.replace(tzinfo=timezone.utc).astimezone(MSK)
+            local_time = msk_time.strftime("%d.%m.%Y %H:%M:%S")
+            return f"🔴 Не в сети (был(а) {local_time} МСК)"
+        return "🔴 Не в сети"
     elif isinstance(status, UserStatusRecently):
-        return "Был(а) недавно"
+        return "🟡 Был(а) недавно"
     elif isinstance(status, UserStatusLastWeek):
-        return "Был(а) на этой неделе"
+        return "🟠 Был(а) на этой неделе"
     elif isinstance(status, UserStatusLastMonth):
-        return "Был(а) в этом месяце"
+        return "🟠 Был(а) в этом месяце"
     elif status is None:
-        return "Статус скрыт"
-    return "Неизвестный статус"
+        return "⚪ Статус скрыт"
+    return "❓ Неизвестный статус"
 
 
 def status_changed(old_status, new_status):
@@ -83,6 +89,46 @@ def status_changed(old_status, new_status):
     if isinstance(old_status, UserStatusOffline) and isinstance(new_status, UserStatusOffline):
         return old_status.was_online != new_status.was_online
     return False
+
+
+async def send_main_menu(event):
+    is_authorized = user_client and user_client.is_connected() and await user_client.is_user_authorized()
+
+    if is_authorized:
+        me = await user_client.get_me()
+        name = me.first_name or ""
+        if me.last_name:
+            name += f" {me.last_name}"
+        uname = f" (@{me.username})" if me.username else ""
+
+        watch_text = f"👁 Отслеживается: @{watched_username}" if watched_username else ""
+
+        buttons = []
+        if watched_username:
+            buttons.append([Button.inline("🔍 Проверить статус сейчас", b"check_now")])
+            buttons.append([Button.inline("🛑 Остановить отслеживание", b"unwatch")])
+        else:
+            buttons.append([Button.inline("👁 Отслеживать пользователя", b"watch")])
+        buttons.append([Button.inline("ℹ️ Статус аккаунта", b"status")])
+        buttons.append([Button.inline("🚪 Выйти из аккаунта", b"logout")])
+
+        text = (
+            f"🏠 **Главное меню**\n\n"
+            f"✅ Аккаунт: {name}{uname}\n"
+            f"🆔 ID: {me.id}\n"
+        )
+        if watch_text:
+            text += f"\n{watch_text}\n"
+    else:
+        buttons = [
+            [Button.inline("🔑 Войти в аккаунт", b"login")],
+        ]
+        text = (
+            "👋 **Привет! Я бот для отслеживания онлайн-статуса в Telegram.**\n\n"
+            "🔐 Для начала нужно войти в аккаунт."
+        )
+
+    await event.respond(text, buttons=buttons, parse_mode="md")
 
 
 async def monitor_loop():
@@ -109,7 +155,12 @@ async def monitor_loop():
                 if isinstance(new_status, UserStatusOnline):
                     await bot.send_message(
                         ADMIN_ID,
-                        f"🟢 @{watched_username} сейчас в сети!",
+                        f"🟢✨ **@{watched_username} сейчас в сети!** ✨",
+                        buttons=[
+                            [Button.inline("🔍 Проверить ещё раз", b"check_now")],
+                            [Button.inline("🏠 Меню", b"menu")],
+                        ],
+                        parse_mode="md",
                     )
                 last_known_status = new_status
             else:
@@ -119,28 +170,26 @@ async def monitor_loop():
             logger.error(f"Ошибка при проверке статуса @{watched_username}: {e}")
             await bot.send_message(
                 ADMIN_ID,
-                f"Ошибка при проверке статуса @{watched_username}: {e}",
+                f"⚠️ Ошибка при проверке @{watched_username}: {e}",
             )
 
 
 def register_handlers(bot_client):
+
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def cmd_start(event):
         if not is_admin(event):
             return
-        await event.respond(
-            "Привет! Я бот для входа в Telegram-аккаунт и отслеживания онлайн-статуса.\n\n"
-            "Команды:\n"
-            "/login — начать вход в аккаунт\n"
-            "/status — проверить статус подключения\n"
-            "/logout — выйти из аккаунта\n"
-            "/cancel — отменить процесс входа\n"
-            "/watch — отслеживать статус пользователя (отправьте юзернейм после команды)\n"
-            "/unwatch — прекратить отслеживание"
-        )
+        await send_main_menu(event)
 
-    @bot_client.on(events.NewMessage(pattern="/status"))
-    async def cmd_status(event):
+    @bot_client.on(events.CallbackQuery(data=b"menu"))
+    async def cb_menu(event):
+        if not is_admin(event):
+            return
+        await send_main_menu(event)
+
+    @bot_client.on(events.CallbackQuery(data=b"status"))
+    async def cb_status(event):
         if not is_admin(event):
             return
         if user_client.is_connected() and await user_client.is_user_authorized():
@@ -148,117 +197,131 @@ def register_handlers(bot_client):
             name = me.first_name or ""
             if me.last_name:
                 name += f" {me.last_name}"
-            username = f" (@{me.username})" if me.username else ""
-            await event.respond(
-                f"Аккаунт подключён: {name}{username}\n"
-                f"ID: {me.id}"
-            )
+            uname = f" (@{me.username})" if me.username else ""
+            await event.answer(f"✅ {name}{uname} | ID: {me.id}", alert=True)
         else:
-            await event.respond("Аккаунт не подключён. Используйте /login для входа.")
+            await event.answer("❌ Аккаунт не подключён", alert=True)
 
-    @bot_client.on(events.NewMessage(pattern="/login"))
-    async def cmd_login(event):
+    @bot_client.on(events.CallbackQuery(data=b"login"))
+    async def cb_login(event):
         global login_state
         if not is_admin(event):
             return
 
         if user_client.is_connected() and await user_client.is_user_authorized():
-            await event.respond("Вы уже авторизованы! Используйте /logout для выхода.")
+            await event.answer("✅ Вы уже авторизованы!", alert=True)
             return
 
         login_state = WAITING_PHONE
         await event.respond(
-            "Начинаем процесс входа.\n"
-            "Отправьте номер телефона в международном формате (например: +79001234567):"
+            "🔑 **Вход в аккаунт**\n\n"
+            "📱 Отправьте номер телефона в международном формате:\n"
+            "Пример: `+79001234567`",
+            buttons=[[Button.inline("❌ Отмена", b"cancel_login")]],
+            parse_mode="md",
         )
+        await event.answer()
 
-    @bot_client.on(events.NewMessage(pattern="/cancel"))
-    async def cmd_cancel(event):
+    @bot_client.on(events.CallbackQuery(data=b"cancel_login"))
+    async def cb_cancel_login(event):
         global login_state, login_phone, phone_code_hash
         if not is_admin(event):
             return
-
-        if login_state == LOGIN_IDLE:
-            await event.respond("Нет активного процесса входа.")
-            return
-
         login_state = LOGIN_IDLE
         login_phone = None
         phone_code_hash = None
-        await event.respond("Процесс входа отменён.")
+        await event.answer("❌ Вход отменён")
+        await send_main_menu(event)
 
-    @bot_client.on(events.NewMessage(pattern=r"/watch"))
-    async def cmd_watch(event):
-        global watched_username, watched_input_peer, last_known_status
+    @bot_client.on(events.CallbackQuery(data=b"watch"))
+    async def cb_watch(event):
+        global login_state
         if not is_admin(event):
             return
 
         if not user_client.is_connected() or not await user_client.is_user_authorized():
-            await event.respond("Сначала войдите в аккаунт через /login")
+            await event.answer("❌ Сначала войдите в аккаунт!", alert=True)
             return
 
-        parts = event.text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            await event.respond(
-                "Укажите юзернейм после команды.\n"
-                "Пример: /watch username или /watch @username"
-            )
-            return
-
-        username = parts[1].strip().lstrip("@")
-
-        try:
-            entity = await user_client.get_entity(username)
-            watched_input_peer = await user_client.get_input_entity(entity)
-        except Exception as e:
-            await event.respond(
-                f"Не удалось найти пользователя @{username}.\n"
-                f"Убедитесь, что юзернейм указан верно и у вас есть чат с этим пользователем.\n"
-                f"Ошибка: {e}"
-            )
-            return
-
-        watched_username = username
-        last_known_status = entity.status
-        current_status = format_status(entity.status)
-
-        name = entity.first_name or ""
-        if entity.last_name:
-            name += f" {entity.last_name}"
-
+        login_state = WAITING_USERNAME
         await event.respond(
-            f"Начинаю отслеживание @{username} ({name}).\n"
-            f"Текущий статус: {current_status}\n"
-            f"Проверка каждые 15 секунд. Уведомление придёт, когда пользователь выйдет в сеть.\n"
-            f"Для остановки: /unwatch"
+            "👁 **Отслеживание пользователя**\n\n"
+            "✏️ Отправьте юзернейм пользователя:\n"
+            "Пример: `username` или `@username`",
+            buttons=[[Button.inline("❌ Отмена", b"cancel_watch")]],
+            parse_mode="md",
         )
-        logger.info(f"Начато отслеживание @{username}")
+        await event.answer()
 
-    @bot_client.on(events.NewMessage(pattern="/unwatch"))
-    async def cmd_unwatch(event):
+    @bot_client.on(events.CallbackQuery(data=b"cancel_watch"))
+    async def cb_cancel_watch(event):
+        global login_state
+        if not is_admin(event):
+            return
+        login_state = LOGIN_IDLE
+        await event.answer("❌ Отменено")
+        await send_main_menu(event)
+
+    @bot_client.on(events.CallbackQuery(data=b"unwatch"))
+    async def cb_unwatch(event):
         global watched_username, watched_input_peer, last_known_status
         if not is_admin(event):
             return
 
         if not watched_username:
-            await event.respond("Сейчас никто не отслеживается.")
+            await event.answer("🤷 Никто не отслеживается", alert=True)
             return
 
-        old_username = watched_username
+        old = watched_username
         watched_username = None
         watched_input_peer = None
         last_known_status = None
-        await event.respond(f"Отслеживание @{old_username} остановлено.")
-        logger.info(f"Остановлено отслеживание @{old_username}")
+        logger.info(f"Остановлено отслеживание @{old}")
+        await event.answer(f"🛑 Отслеживание @{old} остановлено")
+        await send_main_menu(event)
 
-    @bot_client.on(events.NewMessage(pattern="/logout"))
-    async def cmd_logout(event):
+    @bot_client.on(events.CallbackQuery(data=b"check_now"))
+    async def cb_check_now(event):
+        global last_known_status
+        if not is_admin(event):
+            return
+
+        if not watched_username or not watched_input_peer:
+            await event.answer("🤷 Никто не отслеживается", alert=True)
+            return
+
+        try:
+            result = await user_client(GetUsersRequest([watched_input_peer]))
+            user = result[0]
+            new_status = user.status
+            last_known_status = new_status
+            status_text = format_status(new_status)
+
+            name = user.first_name or ""
+            if user.last_name:
+                name += f" {user.last_name}"
+
+            await event.respond(
+                f"👤 **@{watched_username}** ({name})\n\n"
+                f"📊 Статус: {status_text}",
+                buttons=[
+                    [Button.inline("🔄 Обновить", b"check_now")],
+                    [Button.inline("🏠 Меню", b"menu")],
+                ],
+                parse_mode="md",
+            )
+            await event.answer()
+        except Exception as e:
+            await event.answer(f"⚠️ Ошибка: {e}", alert=True)
+
+    @bot_client.on(events.CallbackQuery(data=b"logout"))
+    async def cb_logout(event):
         global login_state, watched_username, watched_input_peer, last_known_status
         if not is_admin(event):
             return
 
         if not user_client.is_connected() or not await user_client.is_user_authorized():
-            await event.respond("Аккаунт не подключён.")
+            await event.answer("❌ Аккаунт не подключён", alert=True)
             return
 
         if watched_username:
@@ -269,11 +332,13 @@ def register_handlers(bot_client):
 
         await user_client.log_out()
         login_state = LOGIN_IDLE
-        await event.respond("Вы успешно вышли из аккаунта.")
+        await event.answer("🚪 Вы вышли из аккаунта")
+        await send_main_menu(event)
 
     @bot_client.on(events.NewMessage)
     async def handle_message(event):
         global login_state, login_phone, phone_code_hash
+        global watched_username, watched_input_peer, last_known_status
 
         if not is_admin(event):
             return
@@ -281,17 +346,64 @@ def register_handlers(bot_client):
         if event.text.startswith("/"):
             return
 
+        # --- Ввод юзернейма для отслеживания ---
+        if login_state == WAITING_USERNAME:
+            username = event.text.strip().lstrip("@")
+            if not username:
+                await event.respond("❌ Пустой юзернейм. Попробуйте ещё раз:")
+                return
+
+            try:
+                entity = await user_client.get_entity(username)
+                watched_input_peer = await user_client.get_input_entity(entity)
+            except Exception as e:
+                await event.respond(
+                    f"❌ Не удалось найти **@{username}**\n"
+                    f"Убедитесь, что юзернейм верный и у вас есть чат с этим пользователем.\n\n"
+                    f"⚠️ Ошибка: `{e}`",
+                    buttons=[[Button.inline("🏠 Меню", b"menu")]],
+                    parse_mode="md",
+                )
+                login_state = LOGIN_IDLE
+                return
+
+            watched_username = username
+            last_known_status = entity.status
+            current_status = format_status(entity.status)
+            login_state = LOGIN_IDLE
+
+            name = entity.first_name or ""
+            if entity.last_name:
+                name += f" {entity.last_name}"
+
+            await event.respond(
+                f"✅ **Отслеживание запущено!**\n\n"
+                f"👤 Пользователь: **@{username}** ({name})\n"
+                f"📊 Текущий статус: {current_status}\n"
+                f"⏱ Проверка каждые 5 секунд\n\n"
+                f"🔔 Уведомление придёт, когда пользователь выйдет в сеть",
+                buttons=[
+                    [Button.inline("🔍 Проверить сейчас", b"check_now")],
+                    [Button.inline("🛑 Остановить", b"unwatch")],
+                    [Button.inline("🏠 Меню", b"menu")],
+                ],
+                parse_mode="md",
+            )
+            logger.info(f"Начато отслеживание @{username}")
+            return
+
         # --- Ввод номера телефона ---
         if login_state == WAITING_PHONE:
             phone = event.text.strip()
             if not phone.startswith("+") or not phone[1:].isdigit():
                 await event.respond(
-                    "Неверный формат номера. Используйте международный формат, например: +79001234567"
+                    "❌ Неверный формат. Используйте:\n`+79001234567`",
+                    parse_mode="md",
                 )
                 return
 
             login_phone = phone
-            await event.respond("Отправляю код подтверждения...")
+            await event.respond("📤 Отправляю код подтверждения...")
 
             try:
                 if not user_client.is_connected():
@@ -301,18 +413,25 @@ def register_handlers(bot_client):
                 phone_code_hash = result.phone_code_hash
                 login_state = WAITING_CODE
                 await event.respond(
-                    "Код отправлен! Введите код подтверждения из Telegram.\n"
-                    "Формат: цифры через пробел или дефис (например: 1 2 3 4 5 или 1-2-3-4-5),\n"
-                    "чтобы Telegram не перехватил сообщение."
+                    "✉️ **Код отправлен!**\n\n"
+                    "Введите код подтверждения из Telegram.\n"
+                    "💡 Формат: цифры через пробел или дефис\n"
+                    "Пример: `1 2 3 4 5` или `1-2-3-4-5`",
+                    buttons=[[Button.inline("❌ Отмена", b"cancel_login")]],
+                    parse_mode="md",
                 )
             except FloodWaitError as e:
                 await event.respond(
-                    f"Слишком много попыток. Подождите {e.seconds} секунд и попробуйте снова."
+                    f"⏳ Слишком много попыток. Подождите {e.seconds} сек.",
+                    buttons=[[Button.inline("🏠 Меню", b"menu")]],
                 )
                 login_state = LOGIN_IDLE
             except Exception as e:
                 logger.error(f"Ошибка при отправке кода: {e}")
-                await event.respond(f"Ошибка при отправке кода: {e}")
+                await event.respond(
+                    f"⚠️ Ошибка: {e}",
+                    buttons=[[Button.inline("🏠 Меню", b"menu")]],
+                )
                 login_state = LOGIN_IDLE
             return
 
@@ -321,7 +440,7 @@ def register_handlers(bot_client):
             code = "".join(c for c in event.text if c.isdigit())
 
             if not code or len(code) < 4:
-                await event.respond("Введите корректный код (минимум 4 цифры).")
+                await event.respond("❌ Введите корректный код (минимум 4 цифры).")
                 return
 
             try:
@@ -335,27 +454,37 @@ def register_handlers(bot_client):
                 name = me.first_name or ""
                 if me.last_name:
                     name += f" {me.last_name}"
-                await event.respond(f"Вход выполнен успешно! Добро пожаловать, {name}!")
+                await event.respond(
+                    f"🎉 **Вход выполнен!**\n\nДобро пожаловать, **{name}**! 👋",
+                    buttons=[
+                        [Button.inline("👁 Отслеживать пользователя", b"watch")],
+                        [Button.inline("🏠 Меню", b"menu")],
+                    ],
+                    parse_mode="md",
+                )
 
             except SessionPasswordNeededError:
                 login_state = WAITING_PASSWORD
                 await event.respond(
-                    "У вас включена двухфакторная аутентификация.\n"
-                    "Введите облачный пароль:"
+                    "🔒 **Двухфакторная аутентификация**\n\n"
+                    "Введите облачный пароль:",
+                    buttons=[[Button.inline("❌ Отмена", b"cancel_login")]],
+                    parse_mode="md",
                 )
             except PhoneCodeInvalidError:
-                await event.respond("Неверный код. Попробуйте ещё раз:")
+                await event.respond("❌ Неверный код. Попробуйте ещё раз:")
             except PhoneCodeExpiredError:
-                await event.respond("Код истёк. Используйте /login чтобы запросить новый.")
+                await event.respond(
+                    "⏰ Код истёк.",
+                    buttons=[[Button.inline("🔑 Попробовать снова", b"login")]],
+                )
                 login_state = LOGIN_IDLE
             except FloodWaitError as e:
-                await event.respond(
-                    f"Слишком много попыток. Подождите {e.seconds} секунд."
-                )
+                await event.respond(f"⏳ Подождите {e.seconds} сек.")
                 login_state = LOGIN_IDLE
             except Exception as e:
                 logger.error(f"Ошибка при вводе кода: {e}")
-                await event.respond(f"Ошибка: {e}")
+                await event.respond(f"⚠️ Ошибка: {e}")
                 login_state = LOGIN_IDLE
             return
 
@@ -370,18 +499,23 @@ def register_handlers(bot_client):
                 name = me.first_name or ""
                 if me.last_name:
                     name += f" {me.last_name}"
-                await event.respond(f"Вход выполнен успешно! Добро пожаловать, {name}!")
+                await event.respond(
+                    f"🎉 **Вход выполнен!**\n\nДобро пожаловать, **{name}**! 👋",
+                    buttons=[
+                        [Button.inline("👁 Отслеживать пользователя", b"watch")],
+                        [Button.inline("🏠 Меню", b"menu")],
+                    ],
+                    parse_mode="md",
+                )
 
             except PasswordHashInvalidError:
-                await event.respond("Неверный пароль. Попробуйте ещё раз:")
+                await event.respond("❌ Неверный пароль. Попробуйте ещё раз:")
             except FloodWaitError as e:
-                await event.respond(
-                    f"Слишком много попыток. Подождите {e.seconds} секунд."
-                )
+                await event.respond(f"⏳ Подождите {e.seconds} сек.")
                 login_state = LOGIN_IDLE
             except Exception as e:
                 logger.error(f"Ошибка при вводе пароля: {e}")
-                await event.respond(f"Ошибка: {e}")
+                await event.respond(f"⚠️ Ошибка: {e}")
                 login_state = LOGIN_IDLE
             return
 
@@ -389,7 +523,7 @@ def register_handlers(bot_client):
 async def main():
     global bot, user_client
 
-    logger.info("Запуск бота...")
+    logger.info("🚀 Запуск бота...")
 
     bot = TelegramClient("bot_session", API_ID, API_HASH)
     user_client = TelegramClient("user_session", API_ID, API_HASH)
@@ -397,22 +531,22 @@ async def main():
     register_handlers(bot)
 
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("Бот запущен.")
+    logger.info("✅ Бот запущен.")
 
     try:
         await user_client.connect()
         if await user_client.is_user_authorized():
             me = await user_client.get_me()
-            logger.info(f"User-клиент подключён: {me.first_name} (ID: {me.id})")
+            logger.info(f"✅ User-клиент подключён: {me.first_name} (ID: {me.id})")
         else:
-            logger.info("User-клиент не авторизован. Используйте /login в боте.")
+            logger.info("⏳ User-клиент не авторизован. Используйте /start в боте.")
     except Exception as e:
-        logger.warning(f"Не удалось подключить user-клиент: {e}")
+        logger.warning(f"⚠️ Не удалось подключить user-клиент: {e}")
 
     asyncio.create_task(monitor_loop())
-    logger.info("Фоновый мониторинг запущен (интервал: 15 сек).")
+    logger.info("👁 Фоновый мониторинг запущен (интервал: 5 сек).")
 
-    logger.info("Бот готов к работе. Нажмите Ctrl+C для остановки.")
+    logger.info("🟢 Бот готов к работе. Нажмите Ctrl+C для остановки.")
     await bot.run_until_disconnected()
 
 
