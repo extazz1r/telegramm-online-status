@@ -10,6 +10,7 @@ from telethon.tl.types import (
     UserStatusLastWeek,
     UserStatusLastMonth,
 )
+from telethon.tl.functions.users import GetUsersRequest
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -49,6 +50,7 @@ phone_code_hash = None
 
 # Мониторинг статуса
 watched_username = None
+watched_input_peer = None  # InputPeer для прямых API-запросов
 last_known_status = None
 CHECK_INTERVAL = 15  # 15 секунд
 
@@ -92,12 +94,12 @@ def status_changed(old_status, new_status):
 
 async def monitor_loop():
     """Фоновая задача: проверяет статус каждые CHECK_INTERVAL секунд."""
-    global last_known_status, watched_username
+    global last_known_status, watched_username, watched_input_peer
 
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
 
-        if not watched_username:
+        if not watched_username or not watched_input_peer:
             continue
 
         if not user_client.is_connected() or not await user_client.is_user_authorized():
@@ -105,11 +107,14 @@ async def monitor_loop():
             continue
 
         try:
-            entity = await user_client.get_entity(watched_username)
-            new_status = entity.status
+            # GetUsersRequest всегда возвращает свежий статус с сервера (без кеша)
+            result = await user_client(GetUsersRequest([watched_input_peer]))
+            user = result[0]
+            new_status = user.status
             new_text = format_status(new_status)
 
             if status_changed(last_known_status, new_status):
+                logger.info(f"Статус @{watched_username} изменился: {format_status(last_known_status)} -> {new_text}")
                 # Уведомляем только когда пользователь вышел в сеть
                 if isinstance(new_status, UserStatusOnline):
                     await bot.send_message(
@@ -197,7 +202,7 @@ async def cmd_cancel(event):
 
 @bot.on(events.NewMessage(pattern=r"/watch"))
 async def cmd_watch(event):
-    global watched_username, last_known_status
+    global watched_username, watched_input_peer, last_known_status
     if not is_admin(event):
         return
 
@@ -219,6 +224,7 @@ async def cmd_watch(event):
     # Проверяем, что пользователь существует и доступен
     try:
         entity = await user_client.get_entity(username)
+        watched_input_peer = await user_client.get_input_entity(entity)
     except Exception as e:
         await event.respond(
             f"Не удалось найти пользователя @{username}.\n"
@@ -246,7 +252,7 @@ async def cmd_watch(event):
 
 @bot.on(events.NewMessage(pattern="/unwatch"))
 async def cmd_unwatch(event):
-    global watched_username, last_known_status
+    global watched_username, watched_input_peer, last_known_status
     if not is_admin(event):
         return
 
@@ -256,6 +262,7 @@ async def cmd_unwatch(event):
 
     old_username = watched_username
     watched_username = None
+    watched_input_peer = None
     last_known_status = None
     await event.respond(f"Отслеживание @{old_username} остановлено.")
     logger.info(f"Остановлено отслеживание @{old_username}")
@@ -263,7 +270,7 @@ async def cmd_unwatch(event):
 
 @bot.on(events.NewMessage(pattern="/logout"))
 async def cmd_logout(event):
-    global login_state, watched_username, last_known_status
+    global login_state, watched_username, watched_input_peer, last_known_status
     if not is_admin(event):
         return
 
@@ -275,6 +282,7 @@ async def cmd_logout(event):
     if watched_username:
         logger.info(f"Остановлено отслеживание @{watched_username} (logout)")
         watched_username = None
+        watched_input_peer = None
         last_known_status = None
 
     await user_client.log_out()
