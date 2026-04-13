@@ -53,6 +53,15 @@ watched_input_peer = None
 last_known_status = None
 CHECK_INTERVAL = 5
 
+# Настройки уведомлений
+notify_settings = {
+    "online": True,     # 🟢 Зашёл в сеть
+    "offline": True,    # 🔴 Вышел из сети
+    "recently": False,  # 🟡 Был(а) недавно
+    "weekly": False,    # 🟠 Был(а) на этой неделе
+    "monthly": False,   # 🟠 Был(а) в этом месяце
+}
+
 # Клиенты создаются в main()
 bot = None
 user_client = None
@@ -109,6 +118,7 @@ async def send_main_menu(event):
             buttons.append([Button.inline("🛑 Остановить отслеживание", b"unwatch")])
         else:
             buttons.append([Button.inline("👁 Отслеживать пользователя", b"watch")])
+        buttons.append([Button.inline("⚙️ Настройки уведомлений", b"settings")])
         buttons.append([Button.inline("ℹ️ Статус аккаунта", b"status")])
         buttons.append([Button.inline("🚪 Выйти из аккаунта", b"logout")])
 
@@ -127,6 +137,45 @@ async def send_main_menu(event):
             "👋 **Привет! Я бот для отслеживания онлайн-статуса в Telegram.**\n\n"
             "🔐 Для начала нужно войти в аккаунт."
         )
+
+    await event.respond(text, buttons=buttons, parse_mode="md")
+
+
+def get_status_key(status):
+    """Возвращает ключ настройки для типа статуса."""
+    if isinstance(status, UserStatusOnline):
+        return "online"
+    elif isinstance(status, UserStatusOffline):
+        return "offline"
+    elif isinstance(status, UserStatusRecently):
+        return "recently"
+    elif isinstance(status, UserStatusLastWeek):
+        return "weekly"
+    elif isinstance(status, UserStatusLastMonth):
+        return "monthly"
+    return None
+
+
+async def send_settings_menu(event):
+    def toggle(key, label):
+        icon = "✅" if notify_settings[key] else "❌"
+        return Button.inline(f"{icon} {label}", f"toggle_{key}".encode())
+
+    buttons = [
+        [toggle("online", "🟢 Зашёл в сеть")],
+        [toggle("offline", "🔴 Вышел из сети")],
+        [toggle("recently", "🟡 Был(а) недавно")],
+        [toggle("weekly", "🟠 Был(а) на этой неделе")],
+        [toggle("monthly", "🟠 Был(а) в этом месяце")],
+        [Button.inline("🔙 Назад в меню", b"menu")],
+    ]
+
+    enabled = [k for k, v in notify_settings.items() if v]
+    if enabled:
+        count = len(enabled)
+        text = f"⚙️ **Настройки уведомлений**\n\n🔔 Включено событий: {count}/5\n\n💡 Нажмите на событие, чтобы вкл/выкл:"
+    else:
+        text = "⚙️ **Настройки уведомлений**\n\n🔕 Все уведомления выключены!\n\n💡 Нажмите на событие, чтобы включить:"
 
     await event.respond(text, buttons=buttons, parse_mode="md")
 
@@ -152,10 +201,11 @@ async def monitor_loop():
 
             if status_changed(last_known_status, new_status):
                 logger.info(f"Статус @{watched_username} изменился: {format_status(last_known_status)} -> {new_text}")
-                if isinstance(new_status, UserStatusOnline):
+                key = get_status_key(new_status)
+                if key and notify_settings.get(key, False):
                     await bot.send_message(
                         ADMIN_ID,
-                        f"🟢✨ **@{watched_username} сейчас в сети!** ✨",
+                        f"🔔 **@{watched_username}**\n\n{new_text}",
                         buttons=[
                             [Button.inline("🔍 Проверить ещё раз", b"check_now")],
                             [Button.inline("🏠 Меню", b"menu")],
@@ -201,6 +251,33 @@ def register_handlers(bot_client):
             await event.answer(f"✅ {name}{uname} | ID: {me.id}", alert=True)
         else:
             await event.answer("❌ Аккаунт не подключён", alert=True)
+
+    @bot_client.on(events.CallbackQuery(data=b"settings"))
+    async def cb_settings(event):
+        if not is_admin(event):
+            return
+        await send_settings_menu(event)
+        await event.answer()
+
+    @bot_client.on(events.CallbackQuery(pattern=b"toggle_"))
+    async def cb_toggle(event):
+        if not is_admin(event):
+            return
+        key = event.data.decode().replace("toggle_", "")
+        if key in notify_settings:
+            notify_settings[key] = not notify_settings[key]
+            state = "✅ Вкл" if notify_settings[key] else "❌ Выкл"
+            labels = {
+                "online": "🟢 Зашёл в сеть",
+                "offline": "🔴 Вышел из сети",
+                "recently": "🟡 Был(а) недавно",
+                "weekly": "🟠 Был(а) на этой неделе",
+                "monthly": "🟠 Был(а) в этом месяце",
+            }
+            await event.answer(f"{labels[key]}: {state}")
+            await send_settings_menu(event)
+        else:
+            await event.answer("❓ Неизвестная настройка", alert=True)
 
     @bot_client.on(events.CallbackQuery(data=b"login"))
     async def cb_login(event):
