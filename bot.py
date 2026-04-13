@@ -50,7 +50,7 @@ phone_code_hash = None
 # Мониторинг статуса
 watched_username = None
 last_known_status = None
-CHECK_INTERVAL = 5 * 60  # 5 минут в секундах
+CHECK_INTERVAL = 15  # 15 секунд
 
 
 def is_admin(event):
@@ -109,17 +109,16 @@ async def monitor_loop():
             new_status = entity.status
             new_text = format_status(new_status)
 
-            if last_known_status is None or status_changed(last_known_status, new_status):
-                old_text = format_status(last_known_status) if last_known_status is not None else "—"
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"👤 @{watched_username}\n"
-                    f"Было: {old_text}\n"
-                    f"Стало: {new_text}",
-                )
+            if status_changed(last_known_status, new_status):
+                # Уведомляем только когда пользователь вышел в сеть
+                if isinstance(new_status, UserStatusOnline):
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"🟢 @{watched_username} сейчас в сети!",
+                    )
                 last_known_status = new_status
             else:
-                logger.info(f"Статус @{watched_username} не изменился: {new_text}")
+                logger.debug(f"Статус @{watched_username} не изменился: {new_text}")
 
         except Exception as e:
             logger.error(f"Ошибка при проверке статуса @{watched_username}: {e}")
@@ -239,7 +238,7 @@ async def cmd_watch(event):
     await event.respond(
         f"Начинаю отслеживание @{username} ({name}).\n"
         f"Текущий статус: {current_status}\n"
-        f"Проверка каждые 5 минут. Вы получите уведомление при изменении статуса.\n"
+        f"Проверка каждые 15 секунд. Уведомление придёт, когда пользователь выйдет в сеть.\n"
         f"Для остановки: /unwatch"
     )
     logger.info(f"Начато отслеживание @{username}")
@@ -419,7 +418,7 @@ async def main():
 
     # Запускаем фоновую задачу мониторинга статуса
     asyncio.create_task(monitor_loop())
-    logger.info("Фоновый мониторинг запущен (интервал: 5 мин).")
+    logger.info("Фоновый мониторинг запущен (интервал: 15 сек).")
 
     logger.info("Бот готов к работе. Нажмите Ctrl+C для остановки.")
     await bot.run_until_disconnected()
