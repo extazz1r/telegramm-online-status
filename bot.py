@@ -1,9 +1,15 @@
 import os
 import asyncio
 import logging
-
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.tl.types import (
+    UserStatusOnline,
+    UserStatusOffline,
+    UserStatusRecently,
+    UserStatusLastWeek,
+    UserStatusLastMonth,
+)
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -41,10 +47,86 @@ login_state = LOGIN_IDLE
 login_phone = None
 phone_code_hash = None
 
+# Мониторинг статуса
+watched_username = None
+last_known_status = None
+CHECK_INTERVAL = 5 * 60  # 5 минут в секундах
+
 
 def is_admin(event):
     """Проверяет, что сообщение от администратора."""
     return event.sender_id == ADMIN_ID
+
+
+def format_status(status):
+    """Форматирует статус пользователя в читаемую строку."""
+    if isinstance(status, UserStatusOnline):
+        return "В сети"
+    elif isinstance(status, UserStatusOffline):
+        was_online = status.was_online
+        if was_online:
+            # Конвертируем в московское время (UTC+3)
+            local_time = was_online.strftime("%d.%m.%Y %H:%M:%S UTC")
+            return f"Не в сети (был(а) {local_time})"
+        return "Не в сети"
+    elif isinstance(status, UserStatusRecently):
+        return "Был(а) недавно"
+    elif isinstance(status, UserStatusLastWeek):
+        return "Был(а) на этой неделе"
+    elif isinstance(status, UserStatusLastMonth):
+        return "Был(а) в этом месяце"
+    elif status is None:
+        return "Статус скрыт"
+    return "Неизвестный статус"
+
+
+def status_changed(old_status, new_status):
+    """Проверяет, изменился ли статус."""
+    if type(old_status) != type(new_status):
+        return True
+    # Для UserStatusOffline сравниваем время was_online
+    if isinstance(old_status, UserStatusOffline) and isinstance(new_status, UserStatusOffline):
+        return old_status.was_online != new_status.was_online
+    return False
+
+
+async def monitor_loop():
+    """Фоновая задача: проверяет статус каждые CHECK_INTERVAL секунд."""
+    global last_known_status, watched_username
+
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+
+        if not watched_username:
+            continue
+
+        if not user_client.is_connected() or not await user_client.is_user_authorized():
+            logger.warning("User-клиент не авторизован, мониторинг приостановлен.")
+            continue
+
+        try:
+            entity = await user_client.get_entity(watched_username)
+            new_status = entity.status
+            new_text = format_status(new_status)
+
+            if last_known_status is None or status_changed(last_known_status, new_status):
+                old_text = format_status(last_known_status) if last_known_status is not None else "—"
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"👤 @{watched_username}\n"
+                    f"Было: {old_text}\n"
+                    f"Стало: {new_text}",
+                )
+                last_known_status = new_status
+            else:
+                logger.info(f"Статус @{watched_username} не изменился: {new_text}")
+
+        except Exception as e:
+            logger.error(f"Ошибка при проверке статуса @{watched_username}: {e}")
+            await bot.send_message(
+                ADMIN_ID,
+                f"Ошибка при проверке статуса @{watched_username}: {e}",
+            )
 
 
 @bot.on(events.NewMessage(pattern="/start"))
@@ -52,12 +134,14 @@ async def cmd_start(event):
     if not is_admin(event):
         return
     await event.respond(
-        "Привет! Я бот для входа в Telegram-аккаунт.\n\n"
+        "Привет! Я бот для входа в Telegram-аккаунт и отслеживания онлайн-статуса.\n\n"
         "Команды:\n"
         "/login — начать вход в аккаунт\n"
         "/status — проверить статус подключения\n"
         "/logout — выйти из аккаунта\n"
-        "/cancel — отменить процесс входа"
+        "/cancel — отменить процесс входа\n"
+        "/watch — отслеживать статус пользователя (отправьте юзернейм после команды)\n"
+        "/unwatch — прекратить отслеживание"
     )
 
 
@@ -112,15 +196,87 @@ async def cmd_cancel(event):
     await event.respond("Процесс входа отменён.")
 
 
+@bot.on(events.NewMessage(pattern=r"/watch"))
+async def cmd_watch(event):
+    global watched_username, last_known_status
+    if not is_admin(event):
+        return
+
+    if not user_client.is_connected() or not await user_client.is_user_authorized():
+        await event.respond("Сначала войдите в аккаунт через /login")
+        return
+
+    # Извлекаем юзернейм из команды: /watch username или /watch @username
+    parts = event.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await event.respond(
+            "Укажите юзернейм после команды.\n"
+            "Пример: /watch username или /watch @username"
+        )
+        return
+
+    username = parts[1].strip().lstrip("@")
+
+    # Проверяем, что пользователь существует и доступен
+    try:
+        entity = await user_client.get_entity(username)
+    except Exception as e:
+        await event.respond(
+            f"Не удалось найти пользователя @{username}.\n"
+            f"Убедитесь, что юзернейм указан верно и у вас есть чат с этим пользователем.\n"
+            f"Ошибка: {e}"
+        )
+        return
+
+    watched_username = username
+    last_known_status = entity.status
+    current_status = format_status(entity.status)
+
+    name = entity.first_name or ""
+    if entity.last_name:
+        name += f" {entity.last_name}"
+
+    await event.respond(
+        f"Начинаю отслеживание @{username} ({name}).\n"
+        f"Текущий статус: {current_status}\n"
+        f"Проверка каждые 5 минут. Вы получите уведомление при изменении статуса.\n"
+        f"Для остановки: /unwatch"
+    )
+    logger.info(f"Начато отслеживание @{username}")
+
+
+@bot.on(events.NewMessage(pattern="/unwatch"))
+async def cmd_unwatch(event):
+    global watched_username, last_known_status
+    if not is_admin(event):
+        return
+
+    if not watched_username:
+        await event.respond("Сейчас никто не отслеживается.")
+        return
+
+    old_username = watched_username
+    watched_username = None
+    last_known_status = None
+    await event.respond(f"Отслеживание @{old_username} остановлено.")
+    logger.info(f"Остановлено отслеживание @{old_username}")
+
+
 @bot.on(events.NewMessage(pattern="/logout"))
 async def cmd_logout(event):
-    global login_state
+    global login_state, watched_username, last_known_status
     if not is_admin(event):
         return
 
     if not user_client.is_connected() or not await user_client.is_user_authorized():
         await event.respond("Аккаунт не подключён.")
         return
+
+    # Останавливаем мониторинг при выходе
+    if watched_username:
+        logger.info(f"Остановлено отслеживание @{watched_username} (logout)")
+        watched_username = None
+        last_known_status = None
 
     await user_client.log_out()
     login_state = LOGIN_IDLE
@@ -260,6 +416,10 @@ async def main():
             logger.info("User-клиент не авторизован. Используйте /login в боте.")
     except Exception as e:
         logger.warning(f"Не удалось подключить user-клиент: {e}")
+
+    # Запускаем фоновую задачу мониторинга статуса
+    asyncio.create_task(monitor_loop())
+    logger.info("Фоновый мониторинг запущен (интервал: 5 мин).")
 
     logger.info("Бот готов к работе. Нажмите Ctrl+C для остановки.")
     await bot.run_until_disconnected()
